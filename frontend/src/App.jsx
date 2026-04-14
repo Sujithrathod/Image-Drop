@@ -3,8 +3,8 @@ import axios from 'axios';
 
 // Your Cloudinary Cloud Name
 const CLOUD_NAME = "dqtiee3ge"; 
-// API URL - uses env variable in production, localhost in development
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
+// API URL - uses env variable in dev, empty string in production (same domain on Vercel)
+const API_URL = import.meta.env.VITE_API_URL || "";
 
 function App() {
   const [mode, setMode] = useState('upload'); // 'upload' or 'view'
