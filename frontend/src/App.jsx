@@ -93,10 +93,16 @@ function App() {
     });
   };
 
-  const clearAll = () => {
+  // Only clears the file picker — does NOT touch message or uploadedFiles
+  const clearFileSelection = () => {
     previews.forEach(url => URL.revokeObjectURL(url));
     setFiles([]);
     setPreviews([]);
+  };
+
+  // Full reset (used when switching type or re-selecting files)
+  const clearAll = () => {
+    clearFileSelection();
     setUploadedFiles([]);
     setMessage({ text: '', type: '' });
   };
@@ -133,10 +139,14 @@ function App() {
 
     try {
       const { data } = await axios.post(`${API_URL}${endpoint}`, formData);
-      setUploadedFiles(data.files);
-      setMessage({ text: `✅ Uploaded ${data.files.length} file(s)! Share the name: "${name}"`, type: 'success' });
-      clearAll();
+      // Clear the file picker but KEEP message + uploadedFiles visible
+      clearFileSelection();
       setName('');
+      setUploadedFiles(data.files);
+      setMessage({
+        text: `✅ Uploaded ${data.files.length} file(s) successfully! Check them in the Download section below.`,
+        type: 'success'
+      });
     } catch (err) {
       setMessage({ text: err.response?.data?.error || 'Upload failed. Please try again.', type: 'error' });
     } finally {
@@ -145,52 +155,80 @@ function App() {
   };
 
   // ── View / fetch ─────────────────────────────────────────────────────────────
-  const handleView = (e) => {
+  const handleView = async (e) => {
     e.preventDefault();
     if (!viewName) return;
     setViewLoading(true);
-
-    // Try: exact name + name_1 … name_5
-    const candidates = [viewName, ...Array.from({ length: MAX_IMAGES }, (_, i) => `${viewName}_${i + 1}`)];
+    setViewResults([]);
 
     if (viewType === 'image') {
+      // Try exact name + _1…_5; onError on <img> hides the slots that don't exist
+      const candidates = [
+        viewName,
+        ...Array.from({ length: MAX_IMAGES }, (_, i) => `${viewName}_${i + 1}`),
+      ];
       setViewResults(candidates.map(n => ({
         name: n,
         url:  `https://res.cloudinary.com/${CLOUD_NAME}/image/upload/${n}`,
         type: 'image',
       })));
+      setViewLoading(false);
     } else {
-      setViewResults(candidates.map(n => ({
-        name: n,
-        url:  `https://res.cloudinary.com/${CLOUD_NAME}/raw/upload/${n}`,
-        type: 'pdf',
-      })));
+      // For documents: try exact name AND _1…_5 variants, resolved via server
+      // The backend stores files as: name.ext (single) or name_1.ext, name_2.ext… (multi)
+      const suffixes = ['', ...Array.from({ length: MAX_FILES }, (_, i) => `_${i + 1}`)];
+
+      try {
+        const settledResults = await Promise.allSettled(
+          suffixes.map(suffix => {
+            const keyName = `${viewName}${suffix}`;
+            return fetch(`${API_URL}/api/file-info?publicId=${encodeURIComponent(keyName)}&type=raw`)
+              .then(r => r.ok ? r.json() : Promise.reject())
+              .then(data => ({ ...data, keyName }));
+          })
+        );
+
+        const found = settledResults
+          .filter(r => r.status === 'fulfilled' && r.value?.url)
+          .map(r => ({
+            name:         r.value.keyName,
+            originalName: r.value.originalName || r.value.keyName,
+            url:          r.value.url,
+            type:         'file',
+          }));
+
+        if (found.length > 0) {
+          setViewResults(found);
+        } else {
+          // Fallback: show a single placeholder so user sees "not found" state
+          setViewResults([{
+            name:         viewName,
+            originalName: viewName,
+            url:          `https://res.cloudinary.com/${CLOUD_NAME}/raw/upload/${viewName}`,
+            type:         'file',
+          }]);
+        }
+      } catch {
+        setViewResults([{
+          name:         viewName,
+          originalName: viewName,
+          url:          `https://res.cloudinary.com/${CLOUD_NAME}/raw/upload/${viewName}`,
+          type:         'file',
+        }]);
+      } finally {
+        setViewLoading(false);
+      }
     }
-    setViewLoading(false);
   };
 
-  // ── Download ─────────────────────────────────────────────────────────────────
-  const handleDownload = async (url, filename, index) => {
-    setDownloading(index);
-    try {
-      const response = await fetch(url);
-      if (!response.ok) throw new Error('Not found');
-      const blob  = await response.blob();
-      const ext   = blob.type.includes('pdf') ? 'pdf' : (blob.type.split('/')[1] || 'jpg');
-      const blobUrl = URL.createObjectURL(blob);
-      const link  = document.createElement('a');
-      link.href   = blobUrl;
-      link.download = `${filename}.${ext}`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(blobUrl);
-    } catch {
-      alert('File not found or could not be downloaded.');
-    } finally {
-      setDownloading(null);
-    }
+  // ── Download — proxied via backend so there are no CORS or MIME issues ────────
+  const handleDownload = (cloudinaryUrl, filename) => {
+    // Build the proxy URL — backend fetches from Cloudinary and streams back
+    // with correct Content-Disposition so the browser saves the file properly
+    const params = new URLSearchParams({ url: cloudinaryUrl, filename });
+    window.open(`${API_URL}/api/download?${params.toString()}`, '_blank');
   };
+
 
   // ── Render ───────────────────────────────────────────────────────────────────
   return (
@@ -350,19 +388,28 @@ function App() {
               )}
             </form>
 
-            {/* Uploaded results */}
+            {/* Uploaded results — visible right after upload */}
             {uploadedFiles.length > 0 && (
               <div style={s.uploadResults}>
-                <div style={s.resultsTitle}>✅ Uploaded Files</div>
+                <div style={s.resultsTitle}>📁 Uploaded — download directly or use the key name in the Downloads tab</div>
                 {uploadedFiles.map((f, i) => (
                   <div key={i} style={s.resultItem}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
-                      <span>{f.type === 'pdf' ? '📄' : '🖼'}</span>
-                      <span style={s.resultName}>{f.name}</span>
+                    <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <span>{getFileIcon(f.originalName || f.name)}</span>
+                        {/* Show the ORIGINAL filename prominently */}
+                        <span style={s.resultName}>{f.originalName || f.name}</span>
+                      </div>
+                      <span style={{ fontSize: '11px', color: '#4b5563', paddingLeft: '28px' }}>
+                        Key: {f.name}
+                      </span>
                     </div>
-                    <a href={f.url} target="_blank" rel="noreferrer" style={s.resultLink}>
-                      Open ↗
-                    </a>
+                    <button
+                      onClick={() => handleDownload(f.url, f.originalName || f.name)}
+                      style={s.downloadBtn}
+                    >
+                      ⬇ Download
+                    </button>
                   </div>
                 ))}
               </div>
@@ -421,10 +468,15 @@ function App() {
                       }}
                     />
                     <div style={s.viewImageActions}>
-                      <span style={s.viewImageName}>{r.name}</span>
-                      <button onClick={() => handleDownload(r.url, r.name, i)}
-                        disabled={downloading === i} style={s.downloadBtn}>
-                        {downloading === i ? '⏳' : '⬇ Download'}
+                      <div style={{ display: 'flex', flexDirection: 'column' }}>
+                        <span style={s.viewImageName}>{r.originalName || r.name}</span>
+                        {r.originalName && r.originalName !== r.name && (
+                          <span style={{ fontSize: '11px', color: '#4b5563' }}>Key: {r.name}</span>
+                        )}
+                      </div>
+                      <button onClick={() => handleDownload(r.url, r.originalName || r.name)}
+                        style={s.downloadBtn}>
+                        ⬇ Download
                       </button>
                     </div>
                   </div>
@@ -438,15 +490,20 @@ function App() {
                 <div style={s.resultsTitle}>Files — click download to save</div>
                 {viewResults.map((r, i) => (
                   <div key={i} style={s.pdfResultItem}>
-                    <span style={{ fontSize: '1.2rem' }}>📎</span>
-                    <span style={{ ...s.resultName, flex: 1, textAlign: 'left' }}>{r.name}</span>
-                    <button onClick={() => handleDownload(r.url, r.name, i)}
-                      disabled={downloading === i} style={s.downloadBtn}>
-                      {downloading === i ? '⏳ Downloading…' : '⬇ Download'}
+                    <span style={{ fontSize: '1.2rem' }}>{getFileIcon(r.originalName || r.name)}</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ ...s.resultName }}>{r.originalName || r.name}</div>
+                      {r.originalName && r.originalName !== r.name && (
+                        <div style={{ fontSize: '11px', color: '#4b5563' }}>Key: {r.name}</div>
+                      )}
+                    </div>
+                    <button onClick={() => handleDownload(r.url, r.originalName || r.name)}
+                      style={s.downloadBtn}>
+                      ⬇ Download
                     </button>
                   </div>
                 ))}
-                <p style={s.viewHint}>Files that don't exist will fail silently when clicked.</p>
+                <p style={s.viewHint}>Enter the exact key name shown after upload.</p>
               </div>
             )}
           </div>
