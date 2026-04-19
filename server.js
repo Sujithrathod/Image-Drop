@@ -7,48 +7,98 @@ require('dotenv').config();
 const app = express();
 app.use(cors());
 
-
 cloudinary.config({
     cloud_name: process.env.CLOUD_NAME,
     api_key: process.env.API_KEY,
     api_secret: process.env.API_SECRET,
 });
 
-const storage = multer.memoryStorage();
-const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } }); //10 mb limit
+// 15MB per file limit (to support large PDFs)
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 15 * 1024 * 1024 }
+});
 
+// ─── Helper ───────────────────────────────────────────────────────────────────
+const uploadToCloudinary = (buffer, publicId, resourceType = 'auto') => {
+    return new Promise((resolve, reject) => {
+        cloudinary.uploader.upload_stream(
+            { public_id: publicId, resource_type: resourceType },
+            (err, result) => {
+                if (err) reject(err);
+                else resolve(result);
+            }
+        ).end(buffer);
+    });
+};
 
-app.post('/api/upload', upload.single('image'), async (req, res) => {
+// ─── POST /api/upload — Multi-image upload (up to 5 images) ──────────────────
+app.post('/api/upload', upload.array('images', 5), async (req, res) => {
     try {
         const { name } = req.body;
-        const fileBuffer = req.file.buffer;
+        const files = req.files;
 
-        if (!name || !fileBuffer) {
-            return res.status(400).json({ error: "Name and image are required" });
+        if (!name || !files || files.length === 0) {
+            return res.status(400).json({ error: "Name and at least one image are required" });
         }
 
-        // Upload to Cloudinary using the user's name as the public_id
-        const result = await new Promise((resolve, reject) => {
-            cloudinary.uploader.upload_stream(
-                {
-                    public_id: name, // THIS IS THE MAGIC: Name becomes the URL
-                    resource_type: 'auto'
-                },
-                (err, result) => {
-                    if (err) reject(err);
-                    else resolve(result);
-                }
-            ).end(fileBuffer);
-        });
+        const results = await Promise.all(
+            files.map((file, index) => {
+                const publicId = files.length === 1 ? name : `${name}_${index + 1}`;
+                return uploadToCloudinary(file.buffer, publicId, 'image');
+            })
+        );
 
         res.json({
             message: "Upload successful",
-            url: result.secure_url
+            files: results.map((r, i) => ({
+                name: files.length === 1 ? name : `${name}_${i + 1}`,
+                url: r.secure_url,
+                type: 'image'
+            }))
         });
 
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: "Upload failed" });
+        console.error('Image upload error:', error);
+        res.status(500).json({ error: "Image upload failed" });
+    }
+});
+
+// ─── POST /api/upload/pdf — Multi-PDF upload (up to 5 files, 15MB total) ─────
+app.post('/api/upload/pdf', upload.array('pdfs', 5), async (req, res) => {
+    try {
+        const { name } = req.body;
+        const files = req.files;
+
+        if (!name || !files || files.length === 0) {
+            return res.status(400).json({ error: "Name and at least one PDF are required" });
+        }
+
+        // Guard: total size across all PDFs must not exceed 15MB
+        const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+        if (totalSize > 15 * 1024 * 1024) {
+            return res.status(400).json({ error: "Total PDF size exceeds the 15MB limit" });
+        }
+
+        const results = await Promise.all(
+            files.map((file, index) => {
+                const publicId = files.length === 1 ? name : `${name}_${index + 1}`;
+                return uploadToCloudinary(file.buffer, publicId, 'raw');
+            })
+        );
+
+        res.json({
+            message: "Upload successful",
+            files: results.map((r, i) => ({
+                name: files.length === 1 ? name : `${name}_${i + 1}`,
+                url: r.secure_url,
+                type: 'pdf'
+            }))
+        });
+
+    } catch (error) {
+        console.error('PDF upload error:', error);
+        res.status(500).json({ error: "PDF upload failed" });
     }
 });
 
